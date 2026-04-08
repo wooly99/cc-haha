@@ -1,4 +1,4 @@
-# CC 源码解读
+# Claude Code 源码解读
 
 ## 引子：CC 到底在干什么？
 
@@ -9,6 +9,8 @@
 这就是 `Agent Loop` —— 整个 CC 的心脏。
 
 ![反复分析](https://xmmx-bucket.oss-cn-beijing.aliyuncs.com/typora-imgs/2026-04/反复分析.jpg)
+
+> 动画演示：[Claude Code模拟器 | 学习 Claude Code](https://www.xuanyuancode.com/learn-claude-code/simulator)
 
 ## 1. The Agent Loop
 
