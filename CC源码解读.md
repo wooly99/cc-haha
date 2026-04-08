@@ -410,3 +410,201 @@ Tool Use 系统的设计哲学：**工具自描述、调度自适应、权限分
 - 权限三道关（校验 → Hook → 规则）保证安全，又不影响效率
 
 回到 Agent Loop：模型说"我要用 Read 和 Edit"，Loop 调 `runTools()`，工具系统分批并发跑完，把结果喂回去。**就这么简单，也就这么精巧。**
+
+## 3. TodoWrite
+
+上一节讲了 40+ 个工具的通用执行机制。这一节聚焦一个特殊的工具——**TodoWrite**。
+
+它不读文件、不跑命令，**它唯一的作用是帮模型记住"我现在在干嘛，接下来还要干嘛"**。
+
+> 为什么需要它？因为 Agent Loop 可能跑几十轮。模型的注意力在每一轮都被新的工具结果淹没，很容易"做着做着忘了全局目标"。TodoWrite 就是模型给自己写的**备忘录**。
+
+### 数据结构：一条 Todo 长什么样？
+
+源码位置：[types.ts](src/utils/todo/types.ts)
+
+```typescript
+// 一条 Todo 就三个字段
+interface TodoItem {
+  content: string     // 命令式："Fix the login bug"
+  status: 'pending' | 'in_progress' | 'completed'
+  activeForm: string  // 进行时："Fixing the login bug"（用于 UI spinner 显示）
+}
+
+// 整个 Todo 列表就是一个数组
+type TodoList = TodoItem[]
+```
+
+为什么要 `content` 和 `activeForm` 两种文案？
+
+- `content`（命令式）给模型自己看，是"要做什么"
+- `activeForm`（进行时）给用户看，显示在终端 spinner 旁边，是"正在做什么"
+
+```
+⠋ Fixing the login bug...        ← activeForm，用户看到的
+✓ Fix the login bug              ← content，完成后打勾
+```
+
+### TodoWrite 工具本体
+
+源码位置：[TodoWriteTool.ts:31](src/tools/TodoWriteTool/TodoWriteTool.ts#L31)
+
+```typescript
+// ⚠️ 简化伪代码
+export const TodoWriteTool = buildTool({
+  name: 'TodoWrite',
+  shouldDefer: true,              // 延迟加载，不是每次对话都需要
+  
+  inputSchema: z.object({
+    todos: z.array(TodoItemSchema)  // 每次传入完整的 todo 列表（全量替换）
+  }),
+  
+  async call({ todos }, context) {
+    const todoKey = context.agentId ?? getSessionId()
+    const oldTodos = appState.todos[todoKey] ?? []
+    
+    // 核心逻辑：全部完成 → 清空列表
+    const allDone = todos.every(t => t.status === 'completed')
+    const newTodos = allDone ? [] : todos
+    
+    // 写入全局状态
+    context.setAppState(prev => ({
+      ...prev,
+      todos: { ...prev.todos, [todoKey]: newTodos },
+    }))
+    
+    return { oldTodos, newTodos }
+  },
+  
+  isConcurrencySafe: () => true,
+  isReadOnly: () => false,
+})
+```
+
+几个值得注意的设计：
+
+1. **全量替换，不是增量**：每次调用传入完整列表，而不是 add/remove/update 操作。这避免了复杂的并发冲突问题
+2. **全部完成自动清空**：当所有 todo 都 `completed` 时，直接清空。下一轮模型就不会再被旧任务干扰
+3. **按 agentId 隔离**：主 Agent 和 Subagent 各有独立的 todo 列表，互不干扰
+
+### 提醒机制：怎么让模型"记得用"？
+
+TodoWrite 最巧妙的地方不是工具本身，而是**提醒机制**。
+
+模型不是人，你不能指望它"自觉"地维护 todo 列表。CC 的做法是：**隔一段时间，悄悄在消息里塞一条提醒。**
+
+源码位置：[attachments.ts](src/utils/attachments.ts)
+
+```typescript
+// 提醒配置
+const TODO_REMINDER_CONFIG = {
+  TURNS_SINCE_WRITE: 10,         // 距上次 TodoWrite 超过 10 轮
+  TURNS_BETWEEN_REMINDERS: 10,   // 两次提醒间隔至少 10 轮
+}
+
+function getTodoReminderAttachments(messages, context) {
+  const { turnsSinceLastTodoWrite, turnsSinceLastReminder } =
+    getTodoReminderTurnCounts(messages)
+  
+  // 两个条件都满足才提醒
+  if (turnsSinceLastTodoWrite >= 10 && turnsSinceLastReminder >= 10) {
+    return [{ type: 'todo_reminder', content: currentTodos }]
+  }
+  return []
+}
+```
+
+提醒内容被包装成 `<system-reminder>` 注入到消息流中：
+
+```typescript
+// messages.ts — 提醒渲染
+case 'todo_reminder': {
+  const todoItems = attachment.content
+    .map((todo, i) => `${i + 1}. [${todo.status}] ${todo.content}`)
+    .join('\n')
+
+  return wrapInSystemReminder(
+    `The TodoWrite tool hasn't been used recently. ` +
+    `If you're working on tasks that would benefit from tracking progress, ` +
+    `consider using the TodoWrite tool to track progress. ` +
+    `Make sure that you NEVER mention this reminder to the user\n\n` +
+    `Here are the existing contents of your todo list:\n\n[${todoItems}]`
+  )
+}
+```
+
+注意最后一句：**"Make sure that you NEVER mention this reminder to the user"** —— 这条提醒是给模型看的"暗号"，用户永远不会知道。
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant L as Agent Loop
+    participant M as 模型
+    participant T as TodoWrite
+
+    U->>L: "帮我重构这三个文件"
+    L->>M: [系统提示 + 用户消息]
+    M->>T: TodoWrite([{重构A, pending}, {重构B, pending}, {重构C, pending}])
+    T-->>M: ✅ 已更新
+    
+    Note over L,M: ... 10+ 轮工具调用过去了 ...
+    
+    L->>M: [工具结果 + system-reminder: "你该更新 todo 了"]
+    Note right of M: 模型看到提醒，<br/>但不会告诉用户
+    M->>T: TodoWrite([{重构A, completed}, {重构B, in_progress}, {重构C, pending}])
+    T-->>M: ✅ 已更新
+    
+    Note over L,M: ... 继续工作 ...
+    
+    M->>T: TodoWrite([{重构A, completed}, {重构B, completed}, {重构C, completed}])
+    T-->>M: ✅ 全部完成，列表已清空
+```
+
+### 验证提示：完成后的最后一道关
+
+还有一个细节——当模型一口气完成 3 个以上任务，且没有一个是"验证"步骤时，TodoWrite 会在结果中塞一句话：
+
+```typescript
+// TodoWriteTool.ts 行 76-86
+const verificationNudgeNeeded =
+  allDone &&
+  todos.length >= 3 &&
+  !todos.some(t => t.content.toLowerCase().includes('verif'))
+
+// 如果需要验证提示，工具结果中追加：
+"NOTE: You just closed out 3+ tasks and none of them was a verification step.
+ Before writing your final summary, spawn the verification agent..."
+```
+
+> 做了三件事就全说"完成了"？先等等，**跑个验证再交差。** 这是 CC 对代码质量的内建保障。
+
+### 全景：TodoWrite 在 Agent Loop 中的位置
+
+```mermaid
+flowchart TD
+    A[Agent Loop 第 N 轮] --> B{需要提醒吗？}
+    B -->|距上次 TodoWrite ≥10 轮| C["注入 system-reminder<br/>（模型可见，用户不可见）"]
+    B -->|不需要| D[正常消息]
+    C --> E[模型收到提醒]
+    D --> E
+    E --> F{模型决定}
+    F -->|调用 TodoWrite| G["更新 AppState.todos<br/>全量替换"]
+    F -->|不调用| H[继续其他工具]
+    G --> I{全部 completed?}
+    I -->|是| J["清空列表 + 可能触发验证提示"]
+    I -->|否| K[保持列表]
+    J --> L[下一轮循环]
+    K --> L
+```
+
+TodoWrite 的状态存储在 **AppState**（内存中），不做文件持久化。会话结束就消失——因为它本来就是为单次对话服务的"草稿纸"。
+
+### 小结
+
+TodoWrite 的本质是**模型的工作记忆外挂**。
+
+- 它不改文件、不跑命令，只维护一个 `[{content, status, activeForm}]` 数组
+- 通过 `system-reminder` 定期提醒模型"该更新进度了"，但**绝不让用户看到这个提醒**
+- 全部完成时自动清空，3+ 任务完成时催一句"要不要验证一下"
+
+**Agent 跑几十轮不迷路，靠的就是这张草稿纸。**
