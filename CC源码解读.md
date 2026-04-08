@@ -608,3 +608,186 @@ TodoWrite 的本质是**模型的工作记忆外挂**。
 - 全部完成时自动清空，3+ 任务完成时催一句"要不要验证一下"
 
 **Agent 跑几十轮不迷路，靠的就是这张草稿纸。**
+
+## 4. Subagent
+
+前三节讲的都是**单个 Agent** 的故事。但有些任务一个 Agent 搞不定——比如"一边改代码一边查文档"，或者"同时在三个分支上做不同的事"。
+
+CC 的解法：**让 Agent 生 Agent。** 模型调用 `Agent` 工具，就能启动一个子代理，子代理跑自己的 Agent Loop，跑完把结果交回来。
+
+```mermaid
+flowchart TD
+    A[父 Agent Loop] -->|"调用 Agent 工具"| B["创建子代理"]
+    B --> C["子代理的 Agent Loop<br/>（独立的 while(true) 循环）"]
+    C -->|"完成"| D["结果返回父 Agent"]
+    D --> A
+    
+    C -->|"调用工具"| E[Read / Edit / Bash ...]
+    E --> C
+```
+
+### AgentTool：怎么生一个子代理？
+
+源码位置：[AgentTool.tsx:196](src/tools/AgentTool/AgentTool.tsx#L196)
+
+```typescript
+// ⚠️ 简化伪代码，实际约 1000 行
+export const AgentTool = buildTool({
+  name: 'Agent',
+  inputSchema: z.object({
+    prompt: z.string(),                    // 交给子代理的任务
+    description: z.string(),               // 3-5 字简述
+    subagent_type: z.string().optional(),  // 代理类型
+    model: z.enum(['sonnet', 'opus', 'haiku']).optional(),
+    run_in_background: z.boolean().optional(),
+    isolation: z.enum(['worktree']).optional(),
+  }),
+
+  async call({ prompt, subagent_type, model, isolation, run_in_background }, context) {
+    // ① 找到代理定义
+    const agentDef = findAgentDefinition(subagent_type)
+    
+    // ② 组装工具池（子代理有工具限制）
+    const tools = filterToolsForAgent(allTools, agentDef)
+    
+    // ③ 构建系统提示
+    const systemPrompt = agentDef.getSystemPrompt()
+    
+    // ④ 如果需要 worktree 隔离
+    if (isolation === 'worktree') {
+      cwd = await createWorktree(slug)
+    }
+    
+    // ⑤ 启动子代理的 Agent Loop
+    if (run_in_background) {
+      registerAsyncAgent(agentId, { prompt, tools, systemPrompt })
+      return { status: 'running_in_background', agentId }
+    } else {
+      // 同步执行：跑完才返回
+      return await runAgent({ prompt, tools, systemPrompt, cwd })
+    }
+  }
+})
+```
+
+> 本质上，**子代理就是一个带有不同配置的新 Agent Loop**。它有自己的系统提示、工具列表、工作目录，但共享全局状态。
+
+### 子代理的类型
+
+CC 内置了多种"性格"不同的代理（[builtInAgents.ts](src/tools/AgentTool/builtInAgents.ts)）：
+
+| 类型 | 用途 | 工具范围 | 特点 |
+|------|------|---------|------|
+| **general-purpose** | 通用任务 | 几乎所有工具（除 Agent 自身） | 默认类型 |
+| **Explore** | 代码探索 | 只读工具（Read/Grep/Glob/WebFetch） | 不能编辑，适合调研 |
+| **Plan** | 制定方案 | 只读工具 | 不能编辑，只输出计划 |
+| **code-reviewer** | 代码审查 | 只读工具 | 独立审查，避免偏见 |
+| **verification** | 验证结果 | 只读 + Bash | 跑测试验证，不改代码 |
+
+每种类型本质上是一套**预设配置**：
+
+```typescript
+// builtInAgents.ts — 以 Explore 为例
+const EXPLORE_AGENT: AgentDefinition = {
+  agentType: 'Explore',
+  tools: ['Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch', 'Bash', 'ToolSearch'],
+  model: 'sonnet',                    // 用更快更便宜的模型
+  permissionMode: 'acceptEdits',      // 只读操作不需要频繁问权限
+  getSystemPrompt: () => '你是一个代码探索专家...',
+}
+```
+
+### 共享什么？隔离什么？
+
+这是理解子代理的关键：
+
+```mermaid
+flowchart LR
+    subgraph 共享
+        S1[AppState<br/>全局状态]
+        S2[MCP 连接]
+        S3[权限规则]
+    end
+    
+    subgraph 隔离
+        I1[消息历史<br/>各跑各的]
+        I2[工具列表<br/>子代理有限制]
+        I3[系统提示<br/>按类型不同]
+        I4[Todo 列表<br/>按 agentId 隔离]
+        I5["工作目录<br/>（worktree 时）"]
+    end
+```
+
+| 维度 | 共享还是隔离 | 为什么 |
+|------|------------|--------|
+| **AppState** | 共享 | 父子需要感知彼此的任务状态 |
+| **消息历史** | 隔离 | 子代理只看到自己的 prompt，不需要父的完整对话 |
+| **工具列表** | 隔离（有限制） | 子代理不能嵌套创建子代理、不能直接问用户 |
+| **Todo 列表** | 隔离（按 agentId） | 各管各的任务进度 |
+| **工作目录** | 可选隔离（worktree） | 防止父子同时改同一个文件冲突 |
+
+### 工具限制：子代理不能做什么？
+
+源码位置：[tools.ts](src/constants/tools.ts)
+
+```typescript
+const ALL_AGENT_DISALLOWED_TOOLS = new Set([
+  'Agent',              // ❌ 不能嵌套创建子代理（防止无限递归）
+  'AskUserQuestion',    // ❌ 不能直接问用户（只有父代理能和用户交互）
+  'ExitPlanMode',       // ❌ 计划模式仅主线程控制
+  'TaskOutput',         // ❌ 防止递归输出
+  'TaskStop',           // ❌ 只有父代理能停任务
+])
+```
+
+> 为什么禁止子代理创建子代理？想象一下：Agent 生 Agent 生 Agent……无限递归，token 爆炸，账单爆炸。**一层就够了。**
+
+### 后台运行：不等了，先干别的
+
+`run_in_background: true` 时，父代理不会等子代理跑完，而是立刻继续下一步。
+
+```mermaid
+sequenceDiagram
+    participant P as 父 Agent
+    participant B1 as 后台子代理 1
+    participant B2 as 后台子代理 2
+
+    P->>B1: Agent({ prompt: "查文档", run_in_background: true })
+    P->>B2: Agent({ prompt: "跑测试", run_in_background: true })
+    Note right of P: 不等，继续干别的
+    P->>P: 继续执行其他工具...
+    B1-->>P: 🔔 通知：文档查完了
+    B2-->>P: 🔔 通知：测试跑完了
+```
+
+后台代理完成后通过 `enqueueAgentNotification()` 通知父代理。父代理在下一轮 Agent Loop 中看到通知，决定是否处理。
+
+> 这就是为什么你用 CC 时，有时候会看到"某某 agent 已完成"的通知——那就是后台子代理干完活了在汇报。
+
+### 全景：子代理在架构中的位置
+
+```mermaid
+flowchart TD
+    U[用户] --> P["父 Agent Loop"]
+    
+    P -->|"Agent(Explore)"| E["探索子代理<br/>只读工具 / sonnet"]
+    P -->|"Agent(Plan)"| PL["规划子代理<br/>只读工具"]
+    P -->|"Agent(general, background)"| BG["后台子代理<br/>异步执行"]
+    
+    E -->|"结果"| P
+    PL -->|"结果"| P
+    BG -->|"🔔 通知"| P
+    
+    P -->|"回复"| U
+```
+
+### 小结
+
+Subagent 的本质是**用 Agent Loop 跑 Agent Loop**——同一套机制，不同的配置。
+
+- **节省上下文**：子代理可能跑了 30 轮工具调用，但返回给父代理的只是一段结果摘要。中间过程不会撑爆父代理的上下文窗口
+- **类型系统**让不同任务用不同"性格"的代理（探索用只读的，改代码用通用的）
+- **工具限制**防止子代理越权（不能嵌套、不能问用户）
+- **后台运行**让多个子代理并行，父代理不用干等
+
+一句话：**一个 Agent 不够用？那就多来几个，各司其职，并行不悖。**
