@@ -1,5 +1,9 @@
 # 常见问题
 
+## Q: 使用公司代理（bedrock）时，报错 `API Error: Please wait a moment and try again`
+
+**原因**：@anthropic-ai/bedrock-sdk 没装。Bun 在 dynamic import 时找不到这个模块，抛出的不是标准 Error 而是 Bun 内部的 ResolveMessage 对象，所以错误信息被吞掉了，只显示了 "API Error: Please wait a moment and try again"。
+
 
 ## Q: `undefined is not an object (evaluating 'usage.input_tokens')`
 
