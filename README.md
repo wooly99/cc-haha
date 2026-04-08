@@ -1,5 +1,7 @@
 # Claude Code Haha
 
+> **注意**：@anthropic-ai/bedrock-sdk 没装。Bun 在 dynamic import 时找不到这个模块，抛出的不是标准 Error 而是 Bun 内部的 ResolveMessage 对象，所以错误信息被吞掉了，只显示了 "API Error: Please wait a moment and try again"。
+
 <p align="center">
   <img src="docs/images/banner.jpg" alt="Claude Code Haha Banner" width="800">
 </p>
